@@ -1,154 +1,108 @@
 module SkiLookup
 
-using CSV, DataFrames, Dates, PrettyTables, Statistics
+using CSV, DataFrames, PrettyTables
 
-# ============ Helpers ============
-normalize_str(x) = lowercase(strip(String(x)))
-
-const R_EARTH_KM = 6371.0
-deg2rad(x) = x*pi/180
-function haversine_km(lat1, lon1, lat2, lon2)
-    φ1, λ1, φ2, λ2 = deg2rad.(lat1), deg2rad.(lon1), deg2rad.(lat2), deg2rad.(lon2)
-    dφ, dλ = φ2-φ1, λ2-λ1
-    a = sin(dφ/2)^2 + cos(φ1)*cos(φ2)*sin(dλ/2)^2
-    2R_EARTH_KM * asin(min(1, sqrt(a)))
+# -------- Helper --------
+# Robust gegen „komische“ Zeichen: wenn lowercase crasht, fällt es auf Original zurück
+normalize_str(x) = begin
+    s = try
+        String(x)
+    catch
+        string(x)
+    end
+    try
+        lowercase(strip(s))
+    catch
+        strip(s)   # Fallback ohne lowercase (verhindert InvalidCharError)
+    end
 end
 
-# ============ Loader (raw CSV) ============
-"Resorts: erwartet mind. Spalten: Resort, Latitude, Longitude"
+# -------- Loader nur für resorts.csv --------
+"""
+load_resorts_csv(path) -> DataFrame
+
+Erwartete Pflichtspalten (weitere sind ok): "Resort", "Country", "Continent" (falls vorhanden)
+"""
 function load_resorts_csv(path::AbstractString)
-    df = CSV.read(path, DataFrame)
+    df = CSV.read(path, DataFrame)  # wenn es Encoding-Probleme gibt, sag mir die Fehlermeldung
 
-    # Pflichtspalten korrekt prüfen (kein gefährliches Broadcasting)
-    required = ["Resort","Latitude","Longitude"]
-    @assert all(x -> x in names(df), required) "resorts.csv braucht Spalten: Resort, Latitude, Longitude"
+    # Pflichtspalte "Resort" muss existieren
+    @assert "Resort" ∈ names(df) "resorts.csv braucht mindestens die Spalte: Resort"
 
-    # Normalisierter Name + stabile ID
+    # Normalisierter Schlüssel für exakte Suche (ohne Fuzzy)
     df.name_key = normalize_str.(df.Resort)
-    if :ID ∉ names(df)
-        df.ID = [Int(abs(hash(n)) % (10^9)) for n in df.name_key]   # elementweise
-        # Alternative: df.ID = Int.(abs.(hash.(df.name_key)) .% (10^9))
-    end
+
     return df
 end
 
-"Snow: erwartet Spalten: Month (yyyy-mm-01), Latitude, Longitude, Snow"
-function load_snow_csv(path::AbstractString)
-    df = CSV.read(path, DataFrame)
-    @assert all(x -> x in names(df), ["Month","Latitude","Longitude","Snow"]) "snow.csv braucht Month, Latitude, Longitude, Snow"
+# -------- Build (nur Aufbereiten & Speichern) --------
+"""
+build_resorts(raw_path; out_path="data/processed/resorts_processed.csv")
 
-    # Datum robust parsen
-    df.date = tryparse.(Date, String.(df.Month), Ref(dateformat"y-m-d"))
-    @assert all(.!ismissing.(df.date)) "Month konnte nicht als Datum geparst werden (erwartet yyyy-mm-dd)"
-
-    select!(df, [:date, :Latitude, :Longitude, :Snow])
-    rename!(df, [:date, :lat, :lon, :snow_cm])
+- liest nur resorts.csv
+- fügt 'name_key' hinzu
+- speichert als processed CSV
+"""
+function build_resorts(raw_path::AbstractString; out_path::AbstractString="data/processed/resorts_processed.csv")
+    df = load_resorts_csv(raw_path)
+    sort!(df, :Resort)
+    mkpath(dirname(out_path))
+    CSV.write(out_path, df)
     return df
 end
 
-# ============ ETL / Join ============
+# -------- Queries --------
 """
-build_processed(resorts_csv, snow_csv; out_dir="data/processed")
-
-- ordnet jedem Resort den nächstgelegenen Snow-Gridpunkt zu
-- schreibt CSV: resorts_processed.csv, snow_joined.csv, resort_index.csv
+list_resorts(data_dir="data/processed") -> Vector{String}
 """
-function build_processed(resorts_csv::AbstractString, snow_csv::AbstractString; out_dir::AbstractString="data/processed")
-    resorts = load_resorts_csv(resorts_csv)
-    snow    = load_snow_csv(snow_csv)
-
-    grid = unique(select(snow, [:lat, :lon]))
-    @assert nrow(resorts) > 0 "resorts.csv ist leer?"
-    @assert nrow(grid)    > 0 "snow.csv ist leer?"
-
-    # Vektoren mit richtiger Länge anlegen (kein similar(...) ohne Länge!)
-    nearest_lat = Vector{Float64}(undef, nrow(resorts))
-    nearest_lon = Vector{Float64}(undef, nrow(resorts))
-
-    # simple NN-Suche via Haversine
-    for (i, r) in enumerate(eachrow(resorts))
-        dmin, jmin = Inf, 0
-        for (j, g) in enumerate(eachrow(grid))
-            d = haversine_km(r.Latitude, r.Longitude, g.lat, g.lon)
-            if d < dmin
-                dmin, jmin = d, j
-            end
-        end
-        nearest_lat[i] = grid.lat[jmin]
-        nearest_lon[i] = grid.lon[jmin]
-    end
-    resorts.grid_lat = nearest_lat
-    resorts.grid_lon = nearest_lon
-
-    joined = leftjoin(
-        snow,
-        select(resorts, [:ID, :Resort, :name_key, :Latitude, :Longitude, :grid_lat, :grid_lon]),
-        on = [:lat=>:grid_lat, :lon=>:grid_lon]
-    )
-
-    sort!(joined, [:ID, :date])
-    sort!(resorts, :Resort)
-
-    mkpath(out_dir)
-    CSV.write(joinpath(out_dir, "resorts_processed.csv"), resorts)
-    CSV.write(joinpath(out_dir, "snow_joined.csv"), joined)
-    CSV.write(joinpath(out_dir, "resort_index.csv"),
-              select(resorts, [:ID,:Resort,:Latitude,:Longitude,:grid_lat,:grid_lon]))
-
-    return (; resorts, snow_joined=joined)
-end
-
-# ============ Query & Ausgabe (reads processed CSV) ============
-"Liste verfügbarer Gebiete"
 function list_resorts(data_dir::AbstractString="data/processed")
-    resorts = CSV.read(joinpath(data_dir, "resorts_processed.csv"), DataFrame)
-    collect(resorts.Resort)
+    df = CSV.read(joinpath(data_dir, "resorts_processed.csv"), DataFrame)
+    collect(df.Resort)
 end
 
-"Abfrage eines Gebietes (exakter Name wie in list_resorts)"
-function query_resort(name::AbstractString; data_dir::AbstractString="data/processed")
-    resorts = CSV.read(joinpath(data_dir, "resorts_processed.csv"), DataFrame)
-    snow    = CSV.read(joinpath(data_dir, "snow_joined.csv"), DataFrame)
+"""
+query_resort_meta(name; data_dir="data/processed") -> DataFrame (eine Zeile)
 
+Sucht exakten Namen (case-insensitive über 'name_key').
+"""
+function query_resort_meta(name::AbstractString; data_dir::AbstractString="data/processed")
+    df = CSV.read(joinpath(data_dir, "resorts_processed.csv"), DataFrame)
     key = normalize_str(name)
-    row = findfirst(resorts.name_key .== key)
-    row === nothing && error("Kein Resort gefunden: $name. Erst --list ausführen und exakten Namen verwenden.")
-    rid = resorts.ID[row]
-
-    meta = resorts[row:row, :]
-    series = snow[snow.ID .== rid, :]
-    sort!(series, :date)
-
-    if nrow(series) > 0
-        lastday  = maximum(series.date)
-        lastsnow = first(series[series.date .== lastday, :snow_cm], 1)[1]
-        m7  = mean(skipmissing(series[max(1, end-6):end, :snow_cm]))
-        m30 = mean(skipmissing(series[max(1, end-29):end, :snow_cm]))
-        summary = Dict("last_date"=>string(lastday), "last_snow_cm"=>lastsnow,
-                       "mean_7d"=>m7, "mean_30d"=>m30, "n_days"=>nrow(series))
-    else
-        summary = Dict("message"=>"Keine Snow-Daten gefunden.")
-    end
-    return (; meta, series, summary)
+    idx = findfirst(df.name_key .== key)
+    idx === nothing && error("Kein Resort gefunden: $(name). Erst --list aufrufen und exakten Namen verwenden.")
+    return df[idx:idx, :]
 end
 
-"Schöne Konsolen-Ausgabe"
-function print_resort_report(result; maxrows::Int=20)
-    meta, series, s = result.meta, result.series, result.summary
-    println("=== ", meta.Resort[1], " (ID ", meta.ID[1], ") ===")
-    println("Koord.: (", meta.Latitude[1], ", ", meta.Longitude[1], ")  → Grid: (", meta.grid_lat[1], ", ", meta.grid_lon[1], ")")
-    println("\n--- Zusammenfassung ---")
-    for (k,v) in s
-        println(rpad(k, 12), ": ", v)
-    end
-    println("\n--- Schneeserie (Top $(min(maxrows, nrow(series)))/$(nrow(series))) ---")
-    if nrow(series) == 0
-        println("Keine Daten.")
-    else
-        PrettyTables.pretty_table(first(select(series, [:date, :snow_cm]), maxrows))
-        if nrow(series) > maxrows
-            println("… (mehr Zeilen vorhanden)")
+# -------- Ausgabe --------
+"""
+print_resort_meta(meta; prefer_cols = [...])
+
+Zeigt bevorzugte Spalten (falls vorhanden) in schöner Tabelle,
+und falls etwas fehlt, zeigt alle übrigen Felder kompakt darunter.
+"""
+function print_resort_meta(meta::DataFrame; prefer_cols = [
+        "Resort","Country","Continent","Region","Price","Season",
+        "Skiable area","Elevation","Vertical","Runs","Lifts","Snowmaking",
+        "Latitude","Longitude","Website"
+    ])
+    # 1) Bevorzugte Spalten, die es tatsächlich gibt
+    cols_present = String[]
+    for c in prefer_cols
+        if c ∈ names(meta)
+            push!(cols_present, c)
         end
+    end
+
+    if !isempty(cols_present)
+        println("— Wichtigste Felder —")
+        PrettyTables.pretty_table(meta[:, cols_present]; alignment=:l)
+    end
+
+    # 2) Restliche Felder (optional)
+    remaining = setdiff(names(meta), vcat(cols_present, ["name_key"]))
+    if !isempty(remaining)
+        println("\n— Weitere Felder —")
+        PrettyTables.pretty_table(meta[:, remaining]; alignment=:l)
     end
 end
 
